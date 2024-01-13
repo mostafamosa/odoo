@@ -1,6 +1,4 @@
-==========================
-Using detected Dockerfile!
-==========================
+
 
 # Build time variables
 
