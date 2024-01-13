@@ -1,104 +1,140 @@
-FROM ubuntu:jammy
-MAINTAINER Odoo S.A. <info@odoo.com>
+# Build time variables
 
-SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
+ARG SRCIMAGE=debian:bookworm-slim
 
-# Generate locale C.UTF-8 for postgres and general locale data
-ENV LANG en_US.UTF-8
 
-# Retrieve the target architecture to install the correct wkhtmltopdf package
-ARG TARGETARCH
+FROM  $SRCIMAGE AS builder
 
-# Install some deps, lessc and less-plugin-clean-css, and wkhtmltopdf
+ARG LSMB_VERSION="1.11.7"
+ARG LSMB_DL_DIR="Releases"
+ARG ARTIFACT_LOCATION="https://download.ledgersmb.org/f/$LSMB_DL_DIR/$LSMB_VERSION/ledgersmb-$LSMB_VERSION.tar.gz"
 
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        dirmngr \
-        fonts-noto-cjk \
-        gnupg \
-        libssl-dev \
-        node-less \
-        npm \
-        python3-magic \
-        python3-num2words \
-        python3-odf \
-        python3-pdfminer \
-        python3-pip \
-        python3-phonenumbers \
-        python3-pyldap \
-        python3-qrcode \
-        python3-renderpm \
-        python3-setuptools \
-        python3-slugify \
-        python3-vobject \
-        python3-watchdog \
-        python3-xlrd \
-        python3-xlwt \
-        xz-utils && \
-    if [ -z "${TARGETARCH}" ]; then \
-        TARGETARCH="$(dpkg --print-architecture)"; \
-    fi; \
-    WKHTMLTOPDF_ARCH=${TARGETARCH} && \
-    case ${TARGETARCH} in \
-    "amd64") WKHTMLTOPDF_ARCH=amd64 && WKHTMLTOPDF_SHA=967390a759707337b46d1c02452e2bb6b2dc6d59  ;; \
-    "arm64")  WKHTMLTOPDF_SHA=90f6e69896d51ef77339d3f3a20f8582bdf496cc  ;; \
-    "ppc64le" | "ppc64el") WKHTMLTOPDF_ARCH=ppc64el && WKHTMLTOPDF_SHA=5312d7d34a25b321282929df82e3574319aed25c  ;; \
-    esac \
-    && curl -o wkhtmltox.deb -sSL https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.jammy_${WKHTMLTOPDF_ARCH}.deb \
-    && echo ${WKHTMLTOPDF_SHA} wkhtmltox.deb | sha1sum -c - \
-    && apt-get install -y --no-install-recommends ./wkhtmltox.deb \
-    && rm -rf /var/lib/apt/lists/* wkhtmltox.deb
 
-# install latest postgresql-client
-RUN echo 'deb http://apt.postgresql.org/pub/repos/apt/ jammy-pgdg main' > /etc/apt/sources.list.d/pgdg.list \
-    && GNUPGHOME="$(mktemp -d)" \
-    && export GNUPGHOME \
-    && repokey='B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8' \
-    && gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "${repokey}" \
-    && gpg --batch --armor --export "${repokey}" > /etc/apt/trusted.gpg.d/pgdg.gpg.asc \
-    && gpgconf --kill all \
-    && rm -rf "$GNUPGHOME" \
-    && apt-get update  \
-    && apt-get install --no-install-recommends -y postgresql-client \
-    && rm -f /etc/apt/sources.list.d/pgdg.list \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -x ; \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y update && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y upgrade && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y install dh-make-perl libmodule-cpanfile-perl git wget && \
+  apt-file update
 
-# Install rtlcss (on Debian buster)
-RUN npm install -g rtlcss
+RUN set -x ; \
+  wget --quiet -O /tmp/ledgersmb-$LSMB_VERSION.tar.gz "$ARTIFACT_LOCATION" && \
+  tar -xzf /tmp/ledgersmb-$LSMB_VERSION.tar.gz --directory /srv && \
+  rm -f /tmp/ledgersmb-$LSMB_VERSION.tar.gz && \
+  cd /srv/ledgersmb && \
+  ( ( for lib in $( cpanfile-dump --with-all-features --recommends --no-configure --no-build --no-test ) ; \
+    do \
+      if dh-make-perl locate "$lib" 2>/dev/null ; \
+      then  \
+        : \
+      else \
+        echo no : $lib ; \
+      fi ; \
+    done ) | grep -v dh-make-perl | grep -v 'not found' | grep -vi 'is in Perl ' | cut -d' ' -f4 | sort | uniq | tee /srv/derived-deps ) && \
+  cat /srv/derived-deps
 
-# Install Odoo
-ENV ODOO_VERSION 17.0
-ARG ODOO_RELEASE=20240104
-ARG ODOO_SHA=d6f7e9309786857f820333698010903b1c621c5e
-RUN curl -o odoo.deb -sSL http://nightly.odoo.com/${ODOO_VERSION}/nightly/deb/odoo_${ODOO_VERSION}.${ODOO_RELEASE}_all.deb \
-    && echo "${ODOO_SHA} odoo.deb" | sha1sum -c - \
-    && apt-get update \
-    && apt-get -y install --no-install-recommends ./odoo.deb \
-    && rm -rf /var/lib/apt/lists/* odoo.deb
 
-# Copy entrypoint script and Odoo configuration file
-COPY ./entrypoint.sh /
-COPY ./odoo.conf /etc/odoo/
+#
+#
+#  The real image build starts here
+#
+#
 
-# Set permissions and Mount /var/lib/odoo to allow restoring filestore and /mnt/extra-addons for users addons
-RUN chown odoo /etc/odoo/odoo.conf \
-    && mkdir -p /mnt/extra-addons \
-    && chown -R odoo /mnt/extra-addons
-VOLUME ["/var/lib/odoo", "/mnt/extra-addons"]
 
-# Expose Odoo services
-EXPOSE 8069 8071 8072
+FROM  $SRCIMAGE
+LABEL org.opencontainers.image.authors="LedgerSMB project <devel@lists.ledgersmb.org>"
+LABEL org.opencontainers.image.title="LedgerSMB double-entry accounting web-application"
+LABEL org.opencontainers.image.description="LedgerSMB is a full featured double-entry financial accounting and Enterprise\
+ Resource Planning system accessed via a web browser (Perl/JS with a PostgreSQL\
+ backend) which offers 'Accounts Receivable', 'Accounts Payable' and 'General\
+ Ledger' tracking as well as inventory control and fixed assets handling. The\
+ LedgerSMB client can be a web browser or a programmed API call. The goal of\
+ the LedgerSMB project is to bring high quality ERP and accounting capabilities\
+ to Small and Midsize Businesses."
 
-# Set the default config file
-ENV ODOO_RC /etc/odoo/odoo.conf
+ARG LSMB_VERSION="1.11.7"
+ARG LSMB_DL_DIR="Releases"
+ARG ARTIFACT_LOCATION="https://download.ledgersmb.org/f/$LSMB_DL_DIR/$LSMB_VERSION/ledgersmb-$LSMB_VERSION.tar.gz"
 
-COPY wait-for-psql.py /usr/local/bin/wait-for-psql.py
 
-# Set default user when running the container
-USER odoo
+# Install Perl, Tex, Starman, psql client, and all dependencies
+# Without libclass-c3-xs-perl, performance is terribly slow...
 
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["odoo"]
+# Installing psql client directly from instructions at https://wiki.postgresql.org/wiki/Apt
+# That mitigates issues where the PG instance is running a newer version than this container
+
+
+COPY --from=builder /srv/derived-deps /tmp/derived-deps
+
+RUN set -x ; \
+  echo -n "APT::Install-Recommends \"0\";\nAPT::Install-Suggests \"0\";\n" >> /etc/apt/apt.conf && \
+  mkdir -p /usr/share/man/man1/ && \
+  mkdir -p /usr/share/man/man2/ && \
+  mkdir -p /usr/share/man/man3/ && \
+  mkdir -p /usr/share/man/man4/ && \
+  mkdir -p /usr/share/man/man5/ && \
+  mkdir -p /usr/share/man/man6/ && \
+  mkdir -p /usr/share/man/man7/ && \
+  mkdir -p /usr/share/man/man8/ && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y update && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y upgrade && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y install \
+    wget ca-certificates gnupg \
+    $( cat /tmp/derived-deps ) \
+    libclass-c3-xs-perl \
+    texlive-plain-generic texlive-latex-recommended texlive-fonts-recommended \
+    texlive-xetex fonts-liberation \
+    lsb-release && \
+  echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+  (wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -) && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y update && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -y install postgresql-client && \
+  DEBIAN_FRONTEND="noninteractive" apt-get -q -y install git cpanminus make gcc libperl-dev && \
+  wget --quiet -O /tmp/ledgersmb-$LSMB_VERSION.tar.gz "$ARTIFACT_LOCATION" && \
+  tar -xzf /tmp/ledgersmb-$LSMB_VERSION.tar.gz --directory /srv && \
+  rm -f /tmp/ledgersmb-$LSMB_VERSION.tar.gz && \
+  cpanm --metacpan --notest \
+    --with-feature=starman \
+    --with-feature=latex-pdf-ps \
+    --with-feature=openoffice \
+    --installdeps /srv/ledgersmb/ && \
+  apt-get purge -q -y git cpanminus make gcc libperl-dev && \
+  apt-get autoremove -q -y && \
+  apt-get clean -q && \
+  rm -rf ~/.cpanm/ /var/lib/apt/lists/* /usr/share/man/*
+
+
+WORKDIR /srv/ledgersmb
+
+# master requirements
+
+# Configure outgoing mail to use host, other run time variable defaults
+
+## MAIL
+ENV LSMB_MAIL_SMTPHOST 172.17.0.1
+#ENV LSMB_MAIL_SMTPPORT 25
+#ENV LSMB_MAIL_SMTPSENDER_HOSTNAME (container hostname)
+#ENV LSMB_MAIL_SMTPTLS
+#ENV LSMB_MAIL_SMTPUSER
+#ENV LSMB_MAIL_SMTPPASS
+#ENV LSMB_MAIL_SMTPAUTHMECH
+
+## DATABASE
+ENV POSTGRES_HOST postgres
+ENV POSTGRES_PORT 5432
+ENV DEFAULT_DB lsmb
+
+COPY start.sh /usr/local/bin/start.sh
+
+RUN chmod +x /usr/local/bin/start.sh && \
+  mkdir -p /var/www && \
+  mkdir -p /srv/ledgersmb/local/conf && \
+  chown -R www-data /srv/ledgersmb/local
+
+# Work around an aufs bug related to directory permissions:
+RUN mkdir -p /tmp && chmod 1777 /tmp
+
+# Internal Port Expose
+EXPOSE 5762
+
+USER www-data
+CMD ["start.sh"]
