@@ -1,3 +1,7 @@
+==========================
+Using detected Dockerfile!
+==========================
+
 # Build time variables
 
 ARG SRCIMAGE=debian:bookworm-slim
